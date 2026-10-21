@@ -73,7 +73,7 @@ def evaluate_by_year(
         if len(year_data) == 0:
             continue
         
-        X_year = torch.tensor(year_data[feature_columns].values, dtype=torch.float32).to(device)
+        X_year = torch.tensor(year_data[feature_columns].values, dtype=torch.float32)
         y_year = torch.tensor(year_data[target_column].values.reshape(-1, 1), dtype=torch.float32).to(device)
         
         ensemble_mean, ensemble_var = ensemble_predict(models, X_year, device)
@@ -95,4 +95,3 @@ def evaluate_by_year(
         }
     
     return results
-

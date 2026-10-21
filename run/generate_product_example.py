@@ -30,14 +30,13 @@ def main():
     feature_columns = checkpoint['feature_columns']
     
     print("Reading input data...")
-    df = pd.read_parquet(input_file)
+    df = pd.read_parquet(input_file).reset_index(drop=True)
     
     print("Standardizing data...")
-    temp_standardized = os.path.join(script_dir, "temp_standardized.parquet")
-    df_standardized = standardize_data(df, scalers_path, temp_standardized)
+    df_standardized = standardize_data(df.drop(columns=['xch4'], errors='ignore'), scalers_path, strict=True)
     
     print("Preparing features...")
-    X = torch.tensor(df_standardized[feature_columns].values, dtype=torch.float32).to(device)
+    X = torch.tensor(df_standardized[feature_columns].values, dtype=torch.float32)
     
     print("Making predictions...")
     ensemble_mean, ensemble_variance = ensemble_predict(snapshots, X, device)
@@ -47,6 +46,7 @@ def main():
     
     print("Creating product file...")
     product_df = pd.DataFrame({
+        "time_sequence": df["time_sequence"].values,
         "longitude": df["longitude"].values,
         "latitude": df["latitude"].values,
         "scanline": df["scanline"].values,
@@ -54,14 +54,14 @@ def main():
         "methane_mixing_ratio": methane_mixing_ratio,
         "uncertainty": uncertainty
     })
+    finite = np.isfinite(methane_mixing_ratio) & np.isfinite(uncertainty)
+    product_df = product_df.loc[finite].reset_index(drop=True)
     
     product_df.to_parquet(output_file, index=False)
     print(f"Product saved to: {output_file}")
     print(f"Total records: {len(product_df)}")
     
-    os.remove(temp_standardized)
 
 
 if __name__ == "__main__":
     main()
-

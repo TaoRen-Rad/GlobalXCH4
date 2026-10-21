@@ -17,12 +17,12 @@ def finetune_model(
     X_val: torch.Tensor,
     y_val: torch.Tensor,
     device: torch.device,
-    num_epochs: int = 65,
+    num_epochs: int = 60,
     batch_size: int = 512,
     learning_rate: float = 0.0004,
     snapshot_window_size: int = 5,
     random_seed: int = 42
-) -> Tuple[ProbabilisticMLP, List[Dict], int, float]:
+) -> Tuple[ProbabilisticMLP, List[Dict], List[float], List[int]]:
     """Fine-tune pre-trained model on GOSAT data."""
     torch.manual_seed(random_seed)
     
@@ -35,8 +35,8 @@ def finetune_model(
     model = ProbabilisticMLP(input_size)
     
     if len(saved_feature_columns) != input_size:
-        print(f"Warning: Pre-trained model has {len(saved_feature_columns)} features, "
-              f"but data has {input_size} features")
+        raise ValueError(f"Pre-trained model has {len(saved_feature_columns)} features, "
+                         f"but data has {input_size} features")
     
     model.load_state_dict(pretrained_state)
     model.to(device)
@@ -53,10 +53,8 @@ def finetune_model(
     )
     scaler = GradScaler()
     
-    model_window = deque(maxlen=snapshot_window_size)
-    best_val_loss = float('inf')
-    best_epoch = -1
-    best_snapshots = []
+    snapshots = deque(maxlen=snapshot_window_size)
+    snapshot_epochs = deque(maxlen=snapshot_window_size)
     
     print(f"\nStarting fine-tuning for {num_epochs} epochs...")
     train_losses = []
@@ -69,8 +67,8 @@ def finetune_model(
         for X_batch, y_batch in train_loader:
             with autocast():
                 optimizer.zero_grad()
-                mean, variance = model(X_batch)
-                loss = gaussian_nll_loss(mean, variance, y_batch)
+                mean, log_sigma = model(X_batch)
+                loss = gaussian_nll_loss(mean, log_sigma, y_batch)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -84,23 +82,18 @@ def finetune_model(
         val_loss = 0.0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
-                mean, variance = model(X_batch)
-                loss = gaussian_nll_loss(mean, variance, y_batch)
+                mean, log_sigma = model(X_batch)
+                loss = gaussian_nll_loss(mean, log_sigma, y_batch)
                 val_loss += loss.item() * X_batch.size(0)
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        current_model_state = copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()})
-        model_window.append(current_model_state)
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_snapshots = [copy.deepcopy(state) for state in model_window]
-            print(f"*** New best validation loss: {best_val_loss:.6f} (epoch {epoch+1}) ***")
-        
-        scheduler.step(epoch + 1)
+        # Save at the cycle end, before scheduler.step() restarts the cycle.
+        if scheduler.T_cur == scheduler.T_i - 1:
+            snapshots.append(copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()}))
+            snapshot_epochs.append(epoch + 1)
+
         current_lr = optimizer.param_groups[0]['lr']
         
         if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
@@ -109,8 +102,9 @@ def finetune_model(
                   f"Val Loss: {val_loss:.6f}, "
                   f"LR: {current_lr:.6f}")
     
-    print(f"\nFine-tuning completed! Best model from epoch {best_epoch+1}, "
-          f"validation loss: {best_val_loss:.6f}")
-    
-    return model, best_snapshots, best_epoch, best_val_loss
+        scheduler.step(epoch + 1)
 
+    if len(snapshots) < snapshot_window_size:
+        raise RuntimeError(f"Only {len(snapshots)} complete-cycle snapshots; {snapshot_window_size} required")
+    print(f"\nFine-tuning completed! Snapshot epochs: {list(snapshot_epochs)}")
+    return model, list(snapshots), val_losses, list(snapshot_epochs)

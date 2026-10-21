@@ -26,7 +26,8 @@ def train_model(
     learning_rate: float = 0.005,
     snapshot_window_size: int = 5,
     random_seed: int = 42
-) -> Tuple[ProbabilisticMLP, List[Dict], int, float]:
+) -> Tuple[ProbabilisticMLP, List[Dict], List[float], List[int]]:
+    """Train and retain the last complete cosine-cycle snapshots."""
     # Set random seed
     torch.manual_seed(random_seed)
     
@@ -45,15 +46,13 @@ def train_model(
     # Optimizer and scheduler
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=15, T_mult=1, eta_min=1e-6
+        optimizer, T_0=20, T_mult=1, eta_min=1e-6
     )
     scaler = GradScaler()
     
     # Snapshot ensemble variables
-    model_window = deque(maxlen=snapshot_window_size)
-    best_val_loss = float('inf')
-    best_epoch = -1
-    best_snapshots = []
+    snapshots = deque(maxlen=snapshot_window_size)
+    snapshot_epochs = deque(maxlen=snapshot_window_size)
     
     # Training loop
     print(f"\nStarting training for {num_epochs} epochs...")
@@ -68,8 +67,8 @@ def train_model(
         for X_batch, y_batch in train_loader:
             with autocast():
                 optimizer.zero_grad()
-                mean, variance = model(X_batch)
-                loss = gaussian_nll_loss(mean, variance, y_batch)
+                mean, log_sigma = model(X_batch)
+                loss = gaussian_nll_loss(mean, log_sigma, y_batch)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -85,19 +84,18 @@ def train_model(
         val_loss = 0.0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
-                mean, variance = model(X_batch)
-                loss = gaussian_nll_loss(mean, variance, y_batch)
+                mean, log_sigma = model(X_batch)
+                loss = gaussian_nll_loss(mean, log_sigma, y_batch)
                 val_loss += loss.item() * X_batch.size(0)
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        # Update snapshot window
-        current_model_state = copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()})
-        model_window.append(current_model_state)
-        
-        # Update learning rate
-        scheduler.step(epoch + 1)
+        # Save at the cycle end, before scheduler.step() restarts the cycle.
+        if scheduler.T_cur == scheduler.T_i - 1:
+            snapshots.append(copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()}))
+            snapshot_epochs.append(epoch + 1)
+
         current_lr = optimizer.param_groups[0]['lr']
         
         # Print progress for every epoch
@@ -106,23 +104,18 @@ def train_model(
               f"Val Loss: {val_loss:.6f}, "
               f"Learning Rate: {current_lr:.6f}")
         
-        # Check for best validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_snapshots = [copy.deepcopy(state) for state in model_window]
-            print(f"*** New best validation loss: {best_val_loss:.6f} (epoch {epoch+1}) ***")
-    
-    print(f"\nTraining completed! Best model from epoch {best_epoch+1}, "
-          f"validation loss: {best_val_loss:.6f}")
-    
-    return model, best_snapshots, best_epoch, best_val_loss
+        scheduler.step(epoch + 1)
+
+    if len(snapshots) < snapshot_window_size:
+        raise RuntimeError(f"Only {len(snapshots)} complete-cycle snapshots; {snapshot_window_size} required")
+    print(f"\nTraining completed! Snapshot epochs: {list(snapshot_epochs)}")
+    return model, list(snapshots), val_losses, list(snapshot_epochs)
 
 
 def save_model(
     snapshots: List[Dict],
-    best_epoch: int,
-    best_val_loss: float,
+    validation_losses: List[float],
+    snapshot_epochs: List[int],
     output_mean: float,
     output_scale: float,
     feature_columns: List[str],
@@ -131,8 +124,8 @@ def save_model(
 
     checkpoint = {
         'snapshots': snapshots,
-        'best_epoch': best_epoch,
-        'best_val_loss': best_val_loss,
+        'validation_losses': validation_losses,
+        'snapshot_epochs': snapshot_epochs,
         'output_mean': output_mean,
         'output_scale': output_scale,
         'feature_columns': feature_columns
@@ -148,4 +141,3 @@ def load_model(checkpoint_path: str, device: torch.device) -> Dict:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     print(f"Model loaded from: {checkpoint_path}")
     return checkpoint
-

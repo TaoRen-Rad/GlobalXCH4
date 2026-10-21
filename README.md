@@ -14,7 +14,9 @@ The Global XCH<sub style="font-size: 0.7em;">4</sub> Retrieval is a two-stage pr
 Users need to prepare the data following the steps below:
 1. Download TROPOMI Level 1B and Level 2 product data from the [Copernicus Open Access Hub](https://dataspace.copernicus.eu/).
 2. Use the provided `extract_data.py` script to extract and combine data from L1B and L2 files into Parquet-formatted Pandas DataFrames.
-3. Use the `process_data.py` script to generate standardization parameters and standardize the data for training.
+3. Run `python run/process_data.py` to split 2019–2023 observations by overpass and fit standardization parameters on the training subset. Training, validation, and independent 2024–2025 test files are saved under `run/`.
+
+Fine-tuning uses raw TROPOMI–GOSAT matched files with both satellites' coordinates and the original `gosat_xch4` in ppb. Pairs within 10 km Haversine distance are retained, split by overpass, and standardized using the baseline scalers. Model inputs follow the feature order saved in the baseline checkpoint.
 
 ## Structure
 - **`xch4_retrieval` Package**: Core modules for model definition, training, fine-tuning, evaluation, and data processing.
@@ -48,6 +50,29 @@ Users need to prepare the data following the steps below:
    python run/generate_product_example.py
    ```
 
+
+## Data Availability
+
+The fine-tuned global XCH4 product for 2024–2025 generated in this study is available at [https://doi.org/10.5281/zenodo.21618794](https://doi.org/10.5281/zenodo.21618794).
+
+## Cite as
+
+If you use this work in your research, please cite as follows,
+
+```bibtex
+@article{Luo2027GlobalXCH4,
+  title = {Global {XCH4} retrievals from {TROPOMI} shortwave-infrared radiances through cross-satellite transfer learning},
+  author = {Luo, Yuwen and Chen, Wei and Ren, Tao and Zhao, Changying and Mao, Huiqin and Zhou, Minqiang and Wang, Pucai},
+  year = {2027},
+  journal = {Journal of Quantitative Spectroscopy and Radiative Transfer},
+  volume = {366},
+  pages = {110158},
+  issn = {0022-4073},
+  doi = {10.1016/j.jqsrt.2026.110158}
+}
+```
+
+Y. Luo, W. Chen, T. Ren\*, C. Zhao\*, H. Mao, M. Zhou and P. Wang. Global XCH4 retrievals from TROPOMI shortwave-infrared radiances through cross-satellite transfer learning. *Journal of Quantitative Spectroscopy and Radiative Transfer*, 366: 110158, 2027. doi: [10.1016/j.jqsrt.2026.110158](https://doi.org/10.1016/j.jqsrt.2026.110158).
 
 ## License
 

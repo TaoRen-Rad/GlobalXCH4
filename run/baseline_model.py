@@ -7,45 +7,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from xch4_retrieval.train import train_model, save_model
 from xch4_retrieval.evaluate import evaluate_model
+from xch4_retrieval.process_data import FEATURE_COLUMNS
 
 
 def main():
-    train_file = "/home/luoyuwen/workspace/CH4/reverse/05/run/2019_2023_18w.parquet"
-    test_file_2024 = "/home/luoyuwen/workspace/CH4/reverse/05/run/2024_10w.parquet"
-    test_file_2025 = "/home/luoyuwen/workspace/CH4/reverse/05/run/2025_10w.parquet"
-    scalers_file = "/home/luoyuwen/workspace/CH4/reverse/05/run/scalers_combined.parquet"
-    
     output_dir = os.path.dirname(os.path.abspath(__file__))
+    train_file = os.path.join(output_dir, "train_2019_2023.parquet")
+    val_file = os.path.join(output_dir, "val_2019_2023.parquet")
+    test_file_2024 = os.path.join(output_dir, "2024_10w.parquet")
+    test_file_2025 = os.path.join(output_dir, "2025_10w.parquet")
+    scalers_file = os.path.join(output_dir, "scalers_combined.parquet")
     os.makedirs(output_dir, exist_ok=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     print("\nLoading training data...")
-    train_df = pd.read_parquet(train_file)
-    print(f"Loaded {len(train_df)} samples from training file")
-    
-    train_df = train_df.sample(n=900000, random_state=42).reset_index(drop=True)
-    print(f"Sampled {len(train_df)} samples for training")
-    
-    print("Splitting data by year...")
-    train_list = []
-    val_list = []
-    for year in range(2019, 2024):
-        year_data = train_df[train_df['year'] == year]
-        year_data = year_data.sample(frac=1, random_state=42).reset_index(drop=True)
-        split_idx = int(0.8 * len(year_data))
-        train_list.append(year_data[:split_idx])
-        val_list.append(year_data[split_idx:])
-        print(f"  Year {year}: {len(year_data[:split_idx])} train, {len(year_data[split_idx:])} val")
-    
-    train_df_split = pd.concat(train_list).reset_index(drop=True)
-    val_df = pd.concat(val_list).reset_index(drop=True)
+    train_df_split = pd.read_parquet(train_file)
+    val_df = pd.read_parquet(val_file)
+    if set(train_df_split['time_sequence']) & set(val_df['time_sequence']):
+        raise ValueError("Training and validation share overpasses")
     print(f"Total training samples: {len(train_df_split)}")
     print(f"Total validation samples: {len(val_df)}")
     
-    feature_columns = [col for col in train_df_split.columns 
-                      if col not in ["xch4", "longitude", "latitude", "year", "time_sequence"]]
+    feature_columns = list(FEATURE_COLUMNS)
     print(f"Number of features: {len(feature_columns)}")
     
     print("Preparing tensors...")
@@ -67,7 +52,7 @@ def main():
     print("\n" + "="*60)
     print("Starting model training...")
     print("="*60)
-    model, snapshots, best_epoch, best_val_loss = train_model(
+    model, snapshots, validation_losses, snapshot_epochs = train_model(
         X_train, y_train, X_val, y_val, device,
         num_epochs=200,
         batch_size=4096,
@@ -76,13 +61,13 @@ def main():
     
     print("\n" + "="*60)
     print("Training Summary:")
-    print(f"  Best epoch: {best_epoch + 1}")
-    print(f"  Best validation loss: {best_val_loss:.6f}")
+    print(f"  Snapshot epochs: {snapshot_epochs}")
+    print(f"  Final validation loss: {validation_losses[-1]:.6f}")
     print("="*60)
     
     model_path = os.path.join(output_dir, "xch4_model.pth")
     save_model(
-        snapshots, best_epoch, best_val_loss,
+        snapshots, validation_losses, snapshot_epochs,
         output_mean, output_scale, feature_columns,
         model_path
     )

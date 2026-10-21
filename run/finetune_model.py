@@ -1,152 +1,72 @@
-"""
-Example script for fine-tuning the CH4 inversion model on GOSAT data.
-"""
-
-import os
+from pathlib import Path
 import sys
-import torch
+
+import numpy as np
 import pandas as pd
+import torch
 
-# Add parent directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from xch4_retrieval import (
-    finetune_model,
-    save_model,
-    evaluate_model,
-    load_model
-)
+from xch4_retrieval import finetune_model, save_model, evaluate_model, load_model
+from xch4_retrieval.process_data import filter_gosat_matches, standardize_gosat_data, load_scalers
+from xch4_retrieval.split_data import split_by_time_sequence
 
 
 def main():
-    # File paths
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    pretrained_model_path = os.path.join(script_dir, "xch4_model.pth")
-    scalers_path = os.path.join(script_dir, "scalers_combined.parquet")
-    
-    # GOSAT data paths (modify as needed)
-    base_dir = "/home/luoyuwen/workspace/CH4/reverse/03_final_train/06_fine_file"
-    gosat_data_paths = [
-        os.path.join(base_dir, "gt_2019.parquet"),
-        os.path.join(base_dir, "gt_2020.parquet"),
-        os.path.join(base_dir, "gt_2021.parquet"),
-        os.path.join(base_dir, "gt_2022.parquet"),
-        os.path.join(base_dir, "gt_2023.parquet"),
-    ]
-    
-    output_dir = script_dir
-    os.makedirs(output_dir, exist_ok=True)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    gosat_dfs = []
-    for path in gosat_data_paths:
-        if os.path.exists(path):
-            df = pd.read_parquet(path)
-            if 'year' not in df.columns:
-                year = int(os.path.basename(path).split('_')[1][:4])
-                df['year'] = year
-            gosat_dfs.append(df)
-    
-    if not gosat_dfs:
-        raise ValueError("No GOSAT data files found")
-    
-    gosat_df = pd.concat(gosat_dfs, ignore_index=True)
-    gosat_df = gosat_df[gosat_df['year'].isin([2019, 2020, 2021, 2022, 2023])]
-    
-    train_list = []
-    val_list = []
-    for year in range(2019, 2024):
-        year_data = gosat_df[gosat_df['year'] == year]
-        year_data = year_data.sample(frac=1, random_state=42).reset_index(drop=True)
-        split_idx = int(0.8 * len(year_data))
-        train_list.append(year_data[:split_idx])
-        val_list.append(year_data[split_idx:])
-    
-    train_df = pd.concat(train_list).reset_index(drop=True)
-    val_df = pd.concat(val_list).reset_index(drop=True)
-    
-    feature_columns = [col for col in train_df.columns 
-                      if col not in ["gosat_xch4", "longitude", "latitude", "year"]]
-    
-    X_train = torch.tensor(train_df[feature_columns].values, dtype=torch.float32).to(device)
-    y_train = torch.tensor(train_df["gosat_xch4"].values.reshape(-1, 1), dtype=torch.float32).to(device)
-    X_val = torch.tensor(val_df[feature_columns].values, dtype=torch.float32).to(device)
-    y_val = torch.tensor(val_df["gosat_xch4"].values.reshape(-1, 1), dtype=torch.float32).to(device)
-    
-    scalers_df = pd.read_parquet(scalers_path)
-    output_scaler = scalers_df[(scalers_df['parameter_group'] == 'xch4') & 
-                               (scalers_df['parameter_name'] == 'xch4')]
-    output_mean = output_scaler['mean'].values[0]
-    output_scale = output_scaler['scale'].values[0]
-    
-    model, snapshots, best_epoch, best_val_loss = finetune_model(
-        pretrained_model_path=pretrained_model_path,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        device=device,
-        num_epochs=65,
-        batch_size=512,
-        learning_rate=0.0004
+    script_dir = Path(__file__).resolve().parent
+    pretrained_model_path = script_dir / 'xch4_model.pth'
+    scalers_path = script_dir / 'scalers_combined.parquet'
+    base_dir = script_dir.parent / 'data' / 'tropomi-gosat'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = load_model(pretrained_model_path, torch.device('cpu'))
+    feature_columns = checkpoint['feature_columns']
+    output_mean = checkpoint['output_mean']
+    output_scale = checkpoint['output_scale']
+    scaler = load_scalers(scalers_path).loc['xch4']
+    if not np.allclose([scaler['mean'], scaler['scale']], [output_mean, output_scale], rtol=1e-10, atol=1e-10):
+        raise ValueError('Scaler does not match the pretrained model')
+
+    train_parts, val_parts, test_data = [], [], {}
+    for year in range(2019, 2026):
+        raw = pd.read_parquet(base_dir / f'gt{year}_0.5_l12.parquet')
+        matched = filter_gosat_matches(raw, max_distance_km=10.0)
+        matched['year'] = year
+        print(f'{year}: {len(matched)} pairs within 10 km')
+        if year <= 2023:
+            train, val = split_by_time_sequence(matched, seed=42 + year, spatial=False)
+            train_parts.append(standardize_gosat_data(train, scalers_path))
+            val_parts.append(standardize_gosat_data(val, scalers_path))
+        else:
+            test_data[year] = standardize_gosat_data(matched, scalers_path)
+    train_df = pd.concat(train_parts, ignore_index=True)
+    val_df = pd.concat(val_parts, ignore_index=True)
+    if set(train_df['time_sequence']) & set(val_df['time_sequence']):
+        raise ValueError('Training and validation share overpasses')
+
+    def tensors(frame):
+        x = frame[feature_columns].to_numpy(dtype=np.float32)
+        y = frame['gosat_xch4_standardized'].to_numpy(dtype=np.float32).reshape(-1, 1)
+        if not np.isfinite(x).all() or not np.isfinite(y).all():
+            raise ValueError('Model inputs or labels contain NaN or Inf')
+        return torch.tensor(x, device=device), torch.tensor(y, device=device)
+
+    X_train, y_train = tensors(train_df)
+    X_val, y_val = tensors(val_df)
+    model, snapshots, validation_losses, snapshot_epochs = finetune_model(
+        pretrained_model_path, X_train, y_train, X_val, y_val, device,
+        num_epochs=60, batch_size=512, learning_rate=0.0004,
     )
-    
-    finetuned_model_path = os.path.abspath(os.path.join(output_dir, "xch4_finetuned_model.pth"))
+    model_path = script_dir / 'xch4_finetuned_model.pth'
     save_model(
-        snapshots, best_epoch, best_val_loss,
-        output_mean, output_scale, feature_columns,
-        finetuned_model_path
+        snapshots, validation_losses, snapshot_epochs,
+        output_mean, output_scale, feature_columns, model_path,
     )
-    
-    checkpoint = load_model(pretrained_model_path, device)
-    evaluate_model(
-        checkpoint['snapshots'], X_val, y_val, device,
-        output_mean, output_scale,
-        dataset_name="Validation Set (Original)"
-    )
-    
-    evaluate_model(
-        snapshots, X_val, y_val, device,
-        output_mean, output_scale,
-        dataset_name="Validation Set (Fine-tuned)"
-    )
-    
-    # Test 2024 data
-    test_2024_path = os.path.join(base_dir, "gt_2024.parquet")
-    if os.path.exists(test_2024_path):
-        test_df_2024 = pd.read_parquet(test_2024_path)
-        if 'year' not in test_df_2024.columns:
-            test_df_2024['year'] = 2024
-        
-        X_test_2024 = torch.tensor(test_df_2024[feature_columns].values, dtype=torch.float32).to(device)
-        y_test_2024 = torch.tensor(test_df_2024["gosat_xch4"].values.reshape(-1, 1), dtype=torch.float32).to(device)
-        
-        evaluate_model(
-            snapshots, X_test_2024, y_test_2024, device,
-            output_mean, output_scale,
-            dataset_name="Test Set 2024 (Fine-tuned)"
-        )
-    
-    # Test 2025 data
-    test_2025_path = os.path.join(base_dir, "gt_2025.parquet")
-    if os.path.exists(test_2025_path):
-        test_df_2025 = pd.read_parquet(test_2025_path)
-        if 'year' not in test_df_2025.columns:
-            test_df_2025['year'] = 2025
-        
-        X_test_2025 = torch.tensor(test_df_2025[feature_columns].values, dtype=torch.float32).to(device)
-        y_test_2025 = torch.tensor(test_df_2025["gosat_xch4"].values.reshape(-1, 1), dtype=torch.float32).to(device)
-        
-        evaluate_model(
-            snapshots, X_test_2025, y_test_2025, device,
-            output_mean, output_scale,
-            dataset_name="Test Set 2025 (Fine-tuned)"
-        )
-    
-    print(f"Fine-tuning completed, model saved to: {finetuned_model_path}")
+    for name, states in (('Original', checkpoint['snapshots']), ('Fine-tuned', snapshots)):
+        evaluate_model(states, X_val, y_val, device, output_mean, output_scale, dataset_name=f'Validation ({name})')
+    for year, frame in test_data.items():
+        x, y = tensors(frame)
+        evaluate_model(snapshots, x, y, device, output_mean, output_scale, dataset_name=f'Test {year}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
